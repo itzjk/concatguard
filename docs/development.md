@@ -12,6 +12,14 @@ pipx application:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+CI also checks editable installation with pip 21.2.4 on Python 3.9, matching
+older system Python environments. The `setup.py` entry point delegates to
+setuptools; package metadata stays in `pyproject.toml`. The build backend stays
+below setuptools 80 because its replacement of legacy `develop` invokes pip
+inside the isolated build environment, where old pip does not install itself.
+The optional `dev` extra
+installs pytest for running the same suite through `python -m pytest -q`.
+
 The suite generates short synthetic media in temporary directories, compares
 accepted playlists with FFmpeg's concat demuxer, checks hashes before and after
 inspection, and tests all four exit statuses. A permissive ffprobe is shown
