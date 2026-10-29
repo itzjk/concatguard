@@ -112,27 +112,13 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["status"], "invalid-input")
 
 
-class MediaTests(unittest.TestCase):
+class PlaylistFixture:
     @classmethod
     def setUpClass(cls):
-        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("Integration tests require ffmpeg and ffprobe on PATH.")
         cls.temporary = tempfile.TemporaryDirectory(prefix="concatguard-tests-")
+        cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.base = cls.root / "base.mp4"
-        cls.variant = cls.root / "variant.mp4"
-        for path, size, rate, channels in [(cls.base, "160x90", 48000, 1),
-                                           (cls.variant, "320x180", 44100, 2)]:
-            run_ffmpeg("-f", "lavfi", "-i", f"color=c=blue:s={size}:r=25:d=2",
-                       "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate={rate}:duration=2",
-                       "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-ac", channels, "-shortest", path)
-        cls.raw = cls.root / "raw.h264"
-        run_ffmpeg("-f", "lavfi", "-i", "color=s=160x90:r=25:d=1", "-c:v", "libx264", "-threads", 1, cls.raw)
-        cls.observed = validate(cls.playlist("file base.mp4\n"))["entries"][0]["observed"]
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.temporary.cleanup()
 
     @classmethod
     def playlist(cls, body, name="test.ffconcat"):
@@ -143,10 +129,169 @@ class MediaTests(unittest.TestCase):
     def issues(self, report):
         return report["diagnostics"] + [issue for entry in report["entries"] for issue in entry["diagnostics"]]
 
+
+class ValidatorTests(PlaylistFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.base.write_bytes(b"synthetic placeholder; probes in these tests are mocked")
+
     def metadata(self):
-        observed = self.observed
-        return {"format": {"format_name": observed["format_name"], "start_time": "0", "duration": "2"},
-                "streams": copy.deepcopy(observed["streams"]), "probe_warning": None}
+        return {
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "start_time": "0", "duration": "2"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "mpeg4", "time_base": "1/12800",
+                 "width": 160, "height": 90, "pix_fmt": "yuv420p", "start_time": "0", "duration": "2",
+                 "extradata_hash": "SHA256:original"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "time_base": "1/48000",
+                 "sample_rate": "48000", "channels": 1, "sample_fmt": "fltp",
+                 "start_time": "0", "duration": "2"},
+            ],
+            "probe_warning": None,
+        }
+
+    def test_missing_ffprobe_cli_is_incomplete(self):
+        playlist = self.playlist("file base.mp4\n")
+        empty_path = self.root / "empty-path"
+        empty_path.mkdir(exist_ok=True)
+        process = subprocess.run(
+            [sys.executable, "-m", "concatguard", "--json", str(playlist)],
+            env={**os.environ, "PATH": str(empty_path)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(process.returncode, 2, process.stderr)
+        report = json.loads(process.stdout)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["entries"][0]["line"], 2)
+        self.assertIsNone(report["entries"][0]["observed"])
+        self.assertEqual(report["entries"][0]["diagnostics"][0]["code"], "probe-unavailable")
+
+    def test_unreadable_source(self):
+        source = self.root / "unreadable.mp4"
+        shutil.copyfile(self.base, source)
+        source.chmod(0)
+        try:
+            result = validate(self.playlist("file unreadable.mp4\n"))
+            if os.geteuid() == 0:
+                self.skipTest("Root can read mode-000 files.")
+            self.assertEqual(result["exit_code"], 1)
+            self.assertEqual(result["entries"][0]["diagnostics"][0]["code"], "source-unreadable")
+        finally:
+            source.chmod(0o600)
+
+    def test_unknown_or_estimated_metadata_is_incomplete(self):
+        for duration in [None, "N/A", "nan", "inf", "0"]:
+            data = self.metadata()
+            data["format"]["duration"] = duration
+            with patch("concatguard.validator.probe", return_value=data):
+                result = validate(self.playlist("file base.mp4\nduration 2\n"))
+            self.assertEqual(result["exit_code"], 2)
+            self.assertIsNone(result["entries"][0]["observed"]["duration_seconds"])
+        data = self.metadata()
+        data["probe_warning"] = "Estimating duration from bitrate, this may be inaccurate"
+        with patch("concatguard.validator.probe", return_value=data):
+            self.assertEqual(validate(self.playlist("file base.mp4\n"))["exit_code"], 2)
+
+    def test_zero_or_invalid_stream_metadata(self):
+        for field, value in [("width", 0), ("time_base", "0/1"), ("time_base", "bad")]:
+            data = self.metadata()
+            data["streams"][0][field] = value
+            with patch("concatguard.validator.probe", return_value=data):
+                result = validate(self.playlist("file base.mp4\n"))
+            self.assertEqual(result["exit_code"], 2)
+
+    def test_stream_count_order_codec_and_missing_fields(self):
+        playlist = self.playlist("file base.mp4\nfile base.mp4\n")
+        for change, expected in [
+            (lambda data: data["streams"].pop(), "stream-count-mismatch"),
+            (lambda data: data["streams"].reverse(), "stream-property-differs"),
+            (lambda data: data["streams"][0].update(codec_name="h264"), "stream-property-differs"),
+            (lambda data: data["streams"][0].pop("time_base"), "stream-metadata-unknown"),
+        ]:
+            base = self.metadata()
+            changed = copy.deepcopy(base)
+            change(changed)
+            with patch("concatguard.validator.probe", side_effect=[base, changed]):
+                result = validate(playlist)
+            self.assertNotEqual(result["exit_code"], 0)
+            self.assertIn(expected, [issue["code"] for issue in self.issues(result)])
+
+    def test_rational_equivalence_and_warnings(self):
+        base = self.metadata()
+        changed = copy.deepcopy(base)
+        changed["streams"][0]["time_base"] = "2/25600"
+        changed["streams"][0]["extradata_hash"] = "SHA256:different"
+        with patch("concatguard.validator.probe", side_effect=[base, changed]):
+            result = validate(self.playlist("file base.mp4\nfile base.mp4\n"))
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["summary"]["blocker"], 0)
+        self.assertEqual(result["summary"]["warning"], 1)
+
+    def test_short_audio_bounds(self):
+        data = self.metadata()
+        data["streams"][1]["duration"] = "1"
+        with patch("concatguard.validator.probe", return_value=data):
+            result = validate(self.playlist("file base.mp4\noutpoint 1.5\n"))
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("outpoint-outside-stream", [issue["code"] for issue in self.issues(result)])
+
+    def test_hls_and_nonlocal_sources(self):
+        nested = self.root / "hls.mp4"
+        nested.write_text("#EXTM3U\n#EXTINF:2,\nhttp://127.0.0.1:1/never-request\n")
+        for source in ["hls.mp4", "https://example.invalid/video.mp4", "file:/tmp/a", "concat:a|b"]:
+            with patch("concatguard.validator.probe") as mocked:
+                result = validate(self.playlist(f"file {quote(source)}\n"))
+            mocked.assert_not_called()
+            self.assertEqual(result["exit_code"], 3)
+
+    def test_directory_and_fifo_do_not_block(self):
+        fifo = self.root / "pipe"
+        os.mkfifo(fifo)
+        playlist = self.playlist("file pipe\nfile '.'\n")
+        process = subprocess.run([sys.executable, "-m", "concatguard", "--json", str(playlist)],
+                                 capture_output=True, text=True, timeout=10)
+        result = json.loads(process.stdout)
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["summary"]["blocker"], 2)
+        process = subprocess.run([sys.executable, "-m", "concatguard", "--json", str(fifo)],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 3)
+
+    def test_unsupported_invalid_and_oversize_inputs(self):
+        result = validate(self.playlist("file base.mp4\nstream\n"))
+        self.assertEqual(result["exit_code"], 3)
+        self.assertIn(("unsupported-directive", 3), [(i["code"], i["line"]) for i in self.issues(result)])
+        for raw in [b"\xff", b"file a\x00", b"#" * (1024 * 1024 + 1)]:
+            path = self.root / "invalid.ffconcat"
+            path.write_bytes(raw)
+            self.assertEqual(validate(path)["exit_code"], 3)
+
+    def test_missing_probe_and_total_deadline(self):
+        playlist = self.playlist("file base.mp4\nfile base.mp4\n")
+        with patch("concatguard.validator.probe", side_effect=ProbeError("probe-unavailable", "Missing", True)):
+            self.assertEqual(validate(playlist)["exit_code"], 2)
+        with patch("concatguard.validator.TOTAL_TIMEOUT", 0), patch("concatguard.validator.probe") as mocked:
+            result = validate(playlist)
+        mocked.assert_not_called()
+        self.assertEqual(result["exit_code"], 2)
+        self.assertEqual(result["summary"]["incomplete"], 2)
+
+
+class MediaTests(PlaylistFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            raise unittest.SkipTest("Real-media tests require ffmpeg and ffprobe on PATH; install FFmpeg to run them.")
+        super().setUpClass()
+        cls.variant = cls.root / "variant.mp4"
+        for path, size, rate, channels in [(cls.base, "160x90", 48000, 1),
+                                           (cls.variant, "320x180", 44100, 2)]:
+            run_ffmpeg("-f", "lavfi", "-i", f"color=c=blue:s={size}:r=25:d=2",
+                       "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate={rate}:duration=2",
+                       "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-ac", channels, "-shortest", path)
+        cls.raw = cls.root / "raw.h264"
+        run_ffmpeg("-f", "lavfi", "-i", "color=s=160x90:r=25:d=1", "-c:v", "libx264", "-threads", 1, cls.raw)
 
     def test_valid_real_media_ffmpeg_and_unchanged_hashes(self):
         unusual = ["clip with spaces.mp4", "director's cut.mp4", "back\\slash.mp4", '"double".mp4', "café.mp4"]
@@ -168,19 +313,6 @@ class MediaTests(unittest.TestCase):
         self.assertIn(("source-unreadable", 2), [(item["code"], item["line"]) for item in issues])
         self.assertIn(("outpoint-outside-media", 4), [(item["code"], item["line"]) for item in issues])
         self.assertEqual(result["entries"][1]["observed"]["duration_seconds"], 2)
-
-    def test_unreadable_source(self):
-        source = self.root / "unreadable.mp4"
-        shutil.copyfile(self.base, source)
-        source.chmod(0)
-        try:
-            result = validate(self.playlist("file unreadable.mp4\n"))
-            if os.geteuid() == 0:
-                self.skipTest("Root can read mode-000 files.")
-            self.assertEqual(result["exit_code"], 1)
-            self.assertEqual(result["entries"][0]["diagnostics"][0]["code"], "source-unreadable")
-        finally:
-            source.chmod(0o600)
 
     def test_ranges_and_duration_is_not_a_cut(self):
         for directives, code in [("inpoint 1\noutpoint 0.5", "incoherent-range"),
@@ -244,62 +376,6 @@ class MediaTests(unittest.TestCase):
                 result = validate(self.playlist(f"file {name}\n"))
                 self.assertEqual(result["exit_code"], 0, result)
 
-    def test_unknown_or_estimated_metadata_is_incomplete(self):
-        for duration in [None, "N/A", "nan", "inf", "0"]:
-            data = self.metadata()
-            data["format"]["duration"] = duration
-            with patch("concatguard.validator.probe", return_value=data):
-                result = validate(self.playlist("file base.mp4\nduration 2\n"))
-            self.assertEqual(result["exit_code"], 2)
-            self.assertIsNone(result["entries"][0]["observed"]["duration_seconds"])
-        data = self.metadata()
-        data["probe_warning"] = "Estimating duration from bitrate, this may be inaccurate"
-        with patch("concatguard.validator.probe", return_value=data):
-            self.assertEqual(validate(self.playlist("file base.mp4\n"))["exit_code"], 2)
-
-    def test_zero_or_invalid_stream_metadata(self):
-        for field, value in [("width", 0), ("time_base", "0/1"), ("time_base", "bad")]:
-            data = self.metadata()
-            data["streams"][0][field] = value
-            with patch("concatguard.validator.probe", return_value=data):
-                result = validate(self.playlist("file base.mp4\n"))
-            self.assertEqual(result["exit_code"], 2)
-
-    def test_stream_count_order_codec_and_missing_fields(self):
-        playlist = self.playlist("file base.mp4\nfile base.mp4\n")
-        for change, expected in [
-            (lambda data: data["streams"].pop(), "stream-count-mismatch"),
-            (lambda data: data["streams"].reverse(), "stream-property-differs"),
-            (lambda data: data["streams"][0].update(codec_name="h264"), "stream-property-differs"),
-            (lambda data: data["streams"][0].pop("time_base"), "stream-metadata-unknown"),
-        ]:
-            base = self.metadata()
-            changed = copy.deepcopy(base)
-            change(changed)
-            with patch("concatguard.validator.probe", side_effect=[base, changed]):
-                result = validate(playlist)
-            self.assertNotEqual(result["exit_code"], 0)
-            self.assertIn(expected, [issue["code"] for issue in self.issues(result)])
-
-    def test_rational_equivalence_and_warnings(self):
-        base = self.metadata()
-        changed = copy.deepcopy(base)
-        changed["streams"][0]["time_base"] = "2/25600"
-        changed["streams"][0]["extradata_hash"] = "SHA256:different"
-        with patch("concatguard.validator.probe", side_effect=[base, changed]):
-            result = validate(self.playlist("file base.mp4\nfile base.mp4\n"))
-        self.assertEqual(result["exit_code"], 0)
-        self.assertEqual(result["summary"]["blocker"], 0)
-        self.assertEqual(result["summary"]["warning"], 1)
-
-    def test_short_audio_bounds(self):
-        data = self.metadata()
-        data["streams"][1]["duration"] = "1"
-        with patch("concatguard.validator.probe", return_value=data):
-            result = validate(self.playlist("file base.mp4\noutpoint 1.5\n"))
-        self.assertEqual(result["exit_code"], 1)
-        self.assertIn("outpoint-outside-stream", [issue["code"] for issue in self.issues(result)])
-
     def test_nested_playlist_disguised_as_media(self):
         nested = self.root / "nested.mp4"
         nested.write_text("ffconcat version 1.0\nfile 'base.mp4'\n")
@@ -314,48 +390,6 @@ class MediaTests(unittest.TestCase):
         restricted = subprocess.run(command(nested), capture_output=True, timeout=10)
         self.assertNotEqual(restricted.returncode, 0)
         self.assertIn(b"whitelist", restricted.stderr)
-
-    def test_hls_and_nonlocal_sources(self):
-        nested = self.root / "hls.mp4"
-        nested.write_text("#EXTM3U\n#EXTINF:2,\nhttp://127.0.0.1:1/never-request\n")
-        for source in ["hls.mp4", "https://example.invalid/video.mp4", "file:/tmp/a", "concat:a|b"]:
-            with patch("concatguard.validator.probe") as mocked:
-                result = validate(self.playlist(f"file {quote(source)}\n"))
-            mocked.assert_not_called()
-            self.assertEqual(result["exit_code"], 3)
-
-    def test_directory_and_fifo_do_not_block(self):
-        fifo = self.root / "pipe"
-        os.mkfifo(fifo)
-        playlist = self.playlist("file pipe\nfile '.'\n")
-        process = subprocess.run([sys.executable, "-m", "concatguard", "--json", str(playlist)],
-                                 capture_output=True, text=True, timeout=10)
-        result = json.loads(process.stdout)
-        self.assertEqual(process.returncode, 1)
-        self.assertEqual(result["exit_code"], 1)
-        self.assertEqual(result["summary"]["blocker"], 2)
-        process = subprocess.run([sys.executable, "-m", "concatguard", "--json", str(fifo)],
-                                 capture_output=True, text=True, timeout=10)
-        self.assertEqual(process.returncode, 3)
-
-    def test_unsupported_invalid_and_oversize_inputs(self):
-        result = validate(self.playlist("file base.mp4\nstream\n"))
-        self.assertEqual(result["exit_code"], 3)
-        self.assertIn(("unsupported-directive", 3), [(i["code"], i["line"]) for i in self.issues(result)])
-        for raw in [b"\xff", b"file a\x00", b"#" * (1024 * 1024 + 1)]:
-            path = self.root / "invalid.ffconcat"
-            path.write_bytes(raw)
-            self.assertEqual(validate(path)["exit_code"], 3)
-
-    def test_missing_probe_and_total_deadline(self):
-        playlist = self.playlist("file base.mp4\nfile base.mp4\n")
-        with patch("concatguard.validator.probe", side_effect=ProbeError("probe-unavailable", "Missing", True)):
-            self.assertEqual(validate(playlist)["exit_code"], 2)
-        with patch("concatguard.validator.TOTAL_TIMEOUT", 0), patch("concatguard.validator.probe") as mocked:
-            result = validate(playlist)
-        mocked.assert_not_called()
-        self.assertEqual(result["exit_code"], 2)
-        self.assertEqual(result["summary"]["incomplete"], 2)
 
     def test_nonzero_timestamp_origin(self):
         offset = self.root / "offset.mp4"

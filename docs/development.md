@@ -1,9 +1,15 @@
 # Development
 
-Python 3.9+ and FFmpeg with the `mpeg4`, `aac`, and `libx264` encoders are required
-for the integration suite. Runtime has no Python dependencies. The test suite
-uses the standard library and fails rather than silently skipping media tests
-when FFmpeg is missing. A mode-000 readability test skips when run as root.
+Python 3.9+ runs the unit suite without external media tools. Install FFmpeg
+with the `mpeg4`, `aac`, and `libx264` encoders for the integration suite. On
+macOS use `brew install ffmpeg`; on Ubuntu use `sudo apt-get install ffmpeg`.
+Both `ffmpeg` and `ffprobe` must be on PATH. Runtime has no Python dependencies.
+
+If either binary is missing, the real-media class is explicitly skipped with
+an installation hint. Parser, process bounds, mocked metadata, local-file
+safety, and missing-ffprobe CLI tests still run. With both binaries present,
+encoder or fixture failures remain errors. A mode-000 readability test skips
+when run as root.
 
 The README test command checks the source directly, independently of an installed
 pipx application:
@@ -19,6 +25,19 @@ below setuptools 80 because its replacement of legacy `develop` invokes pip
 inside the isolated build environment, where old pip does not install itself.
 The optional `dev` extra
 installs pytest for running the same suite through `python -m pytest -q`.
+
+From a fresh clone, install the package and test runner together:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -q
+```
+
+CI checks that both binaries execute before running the full suite on Linux
+and macOS. It also runs pytest with an empty tool PATH to cover environments
+without FFmpeg. Skipped integration tests mean those media checks were not
+performed; a passing unit-only run is not a complete release check.
 
 The suite generates short synthetic media in temporary directories, compares
 accepted playlists with FFmpeg's concat demuxer, checks hashes before and after

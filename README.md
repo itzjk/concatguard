@@ -16,7 +16,7 @@ no-static-blockers-found | 2 entries | 0 blockers | 0 incomplete | 0 invalid | 0
 
 ## Quick start
 
-Requires Python 3.9+, [pipx](https://pipx.pypa.io/stable/installation/), and FFmpeg's `ffprobe` on PATH. Supports Linux and macOS.
+Requires Python 3.9+, [pipx](https://pipx.pypa.io/stable/installation/), and FFmpeg's `ffprobe` on PATH. Install FFmpeg with `brew install ffmpeg` on macOS or `sudo apt-get install ffmpeg` on Ubuntu. Supports Linux and macOS.
 
 ```sh
 pipx install git+https://github.com/itzjk/concatguard.git
@@ -91,13 +91,13 @@ pipx install .
 
 ## Contributing
 
-Install from a clone, make FFmpeg available on PATH, and run the real-media suite with one command:
+From a clone, run the standard-library suite with one command:
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-See [development notes](docs/development.md) to regenerate the terminal demo.
+Media integration tests require both `ffmpeg` and `ffprobe` on PATH. Without either, those tests explicitly skip; unit tests still run. CI requires both tools and runs the full suite. See [development notes](docs/development.md) for pytest setup and demo recording.
 
 ## License
 
