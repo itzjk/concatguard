@@ -1,0 +1,4 @@
+ffconcat version 1.0
+file 'media/missing.mp4'
+file 'media/green.mp4'
+outpoint 9

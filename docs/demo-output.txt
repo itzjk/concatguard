@@ -1,0 +1,15 @@
+$ concatguard examples/valid.ffconcat
+no-static-blockers-found | 2 entries | 0 blockers | 0 incomplete | 0 invalid | 0 warnings
+  line 2: 'media/blue.mp4' | range source start -> source end
+    observed 2s, start=0s | 0:video/mpeg4 320x180 tb=1/12800; 1:audio/aac 48000Hz/1ch tb=1/48000
+  line 3: 'media/green.mp4' | range source start -> source end
+    observed 2s, start=0s | 0:video/mpeg4 320x180 tb=1/12800; 1:audio/aac 48000Hz/1ch tb=1/48000
+
+$ concatguard examples/broken.ffconcat
+blocked | 2 entries | 2 blockers | 0 incomplete | 0 invalid | 1 warnings
+  line 2: 'media/missing.mp4' | range source start -> source end
+    BLOCKER line 2 [source-unreadable] Cannot read source: No such file or directory
+  line 3: 'media/green.mp4' | range source start -> 9.0
+    observed 2s, start=0s | 0:video/mpeg4 320x180 tb=1/12800; 1:audio/aac 48000Hz/1ch tb=1/48000
+    BLOCKER line 4 [outpoint-outside-media] outpoint exceeds the observed media end. {"observed_end": 2.0, "requested": 9.0}
+    WARNING line 3 [cut-not-frame-verified] Cut bounds use metadata; keyframes, decoding timestamps and visible frames were not checked.

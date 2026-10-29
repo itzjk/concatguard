@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - run: python -m pip install .
+      - run: python -m unittest discover -s tests -v
+      - run: python examples/make_media.py
+      - run: concatguard examples/valid.ffconcat
+      - name: Check expected demo blockers
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          result = subprocess.run(['concatguard', '--json', 'examples/broken.ffconcat'], capture_output=True, text=True)
+          assert result.returncode == 1, result
+          report = json.loads(result.stdout)
+          assert report['summary']['blocker'] == 2, report
+          PY

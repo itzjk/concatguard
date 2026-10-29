@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "concatguard"
+version = "0.1.0"
+description = "Check FFmpeg concat playlists against local media before rendering."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "ZERACK"}]
+keywords = ["ffmpeg", "ffprobe", "ffconcat", "video-editing", "media-validation", "cli", "continuous-integration"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Repository = "https://github.com/itzjk/concatguard"
+Issues = "https://github.com/itzjk/concatguard/issues"
+
+[project.scripts]
+concatguard = "concatguard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
