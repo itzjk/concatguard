@@ -74,7 +74,14 @@ one decoder thread, and a 64 MiB limit per FFmpeg allocation. The allocation lim
 is not a whole-process memory cap. One probe runs at a time, up to 256 probes;
 each has a 10-second wall-clock deadline and a 1 MiB combined stdout/stderr cap.
 All probing shares a 60-second deadline. Limit failures are incomplete findings.
+At the 257th file entry, inspection stops with an `entry-limit` finding on that
+line. The report contains the first 256 entries; the remaining playlist is
+unchecked. Findings already observed keep their severities and exit precedence.
 There are no retries or paid calls. Process groups are killed and reaped on exit.
+
+MOV safety options remain enabled for every probe, regardless of filename.
+On successful non-MOV probes, the two exact notices saying these options are
+unknown to that demuxer are omitted. Other probe warnings and errors are retained.
 
 This is not an OS sandbox. Mounted network storage looks like a local file to
 the OS, and concurrent file replacement is outside the stable-input assumption.

@@ -103,8 +103,10 @@ def parse(text):
             value = token(rest)
             if name == "file":
                 if len(entries) >= MAX_ENTRIES:
-                    issues.append(diagnostic("invalid", "entry-limit", line,
-                                             f"At most {MAX_ENTRIES} entries are supported."))
+                    issues.append(diagnostic("incomplete", "entry-limit", line,
+                                             f"Inspection is limited to the first {MAX_ENTRIES} entries; "
+                                             "this entry and the remaining playlist were not checked.",
+                                             max_entries=MAX_ENTRIES))
                     break
                 current = Entry(line, value)
                 entries.append(current)

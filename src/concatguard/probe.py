@@ -10,6 +10,10 @@ FORMATS = "mov,matroska,avi,wav,flac,ogg,h264"
 MAX_OUTPUT_BYTES = 1024 * 1024
 PROBE_TIMEOUT = 10.0
 TOTAL_TIMEOUT = 60.0
+MOV_OPTION_NOTICES = {
+    "Option enable_drefs skipped - not known to demuxer.",
+    "Option use_absolute_path skipped - not known to demuxer.",
+}
 STREAM_FIELDS = (
     "index", "codec_type", "codec_name", "codec_tag_string", "profile", "level",
     "time_base", "width", "height", "pix_fmt", "sample_aspect_ratio",
@@ -96,5 +100,8 @@ def probe(path, timeout):
             raise ValueError()
     except (ValueError, UnicodeDecodeError):
         raise ProbeError("probe-invalid-output", "ffprobe returned invalid metadata.", True) from None
+    format_name = data["format"].get("format_name")
+    if isinstance(format_name, str) and format_name and "mov" not in format_name.split(","):
+        detail = "\n".join(line for line in detail.splitlines() if line not in MOV_OPTION_NOTICES)
     data["probe_warning"] = detail or None
     return data

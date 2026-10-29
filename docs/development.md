@@ -1,7 +1,7 @@
 # Development
 
 Python 3.9+ runs the unit suite without external media tools. Install FFmpeg
-with the `mpeg4`, `aac`, and `libx264` encoders for the integration suite. On
+with the `mpeg4`, `aac`, `libx264`, `libvpx-vp9`, and `libopus` encoders for the integration suite. On
 macOS use `brew install ffmpeg`; on Ubuntu use `sudo apt-get install ffmpeg`.
 Both `ffmpeg` and `ffprobe` must be on PATH. Runtime has no Python dependencies.
 

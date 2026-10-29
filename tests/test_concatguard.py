@@ -62,8 +62,11 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(issues)
         self.assertEqual(entries[0].line, 4)
         self.assertEqual(entries[0].directive_lines["outpoint"], 5)
-        _, issues = parse("file a\n" * (MAX_ENTRIES + 1))
+        entries, issues = parse("file a\n" * (MAX_ENTRIES + 1))
+        self.assertEqual(len(entries), MAX_ENTRIES)
         self.assertEqual(issues[0]["code"], "entry-limit")
+        self.assertEqual(issues[0]["severity"], "incomplete")
+        self.assertEqual(issues[0]["line"], MAX_ENTRIES + 1)
 
 
 class ProcessTests(unittest.TestCase):
@@ -74,6 +77,28 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn("concat", FORMATS.split(","))
         self.assertNotIn("hls", FORMATS.split(","))
         self.assertEqual(argv[argv.index("-enable_drefs") + 1], "0")
+        self.assertEqual(argv[argv.index("-use_absolute_path") + 1], "0")
+
+    def test_only_irrelevant_mov_option_notices_are_filtered(self):
+        notices = (b"Option enable_drefs skipped - not known to demuxer.\n"
+                   b"Option use_absolute_path skipped - not known to demuxer.\n")
+        warning = b"Estimating duration from bitrate, this may be inaccurate\n"
+        similar = b"Option another_option skipped - not known to demuxer.\n"
+        for fmt in ["wav", "matroska,webm", "avi", "flac", "ogg", "h264"]:
+            payload = json.dumps({"format": {"format_name": fmt}, "streams": []}).encode()
+            for stderr, expected in [(notices, None), (notices + warning, warning.decode().strip()),
+                                     (notices + similar, similar.decode().strip())]:
+                with self.subTest(fmt=fmt, stderr=stderr):
+                    with patch("concatguard.probe.bounded_run", return_value=(0, payload, stderr)):
+                        self.assertEqual(probe(Path("unused.mp4"), 1)["probe_warning"], expected)
+        for fmt in ["mov,mp4,m4a,3gp,3g2,mj2", None, ""]:
+            payload = json.dumps({"format": {"format_name": fmt}, "streams": []}).encode()
+            with patch("concatguard.probe.bounded_run", return_value=(0, payload, notices)):
+                self.assertEqual(probe(Path("unused.wav"), 1)["probe_warning"], notices.decode().strip())
+        with patch("concatguard.probe.bounded_run", return_value=(1, b"", notices)):
+            with self.assertRaises(ProbeError) as caught:
+                probe(Path("unused.wav"), 1)
+        self.assertIn("enable_drefs", str(caught.exception))
 
     def test_timeout_and_output_caps(self):
         cases = [("import time; time.sleep(30)", 0.1, "probe-timeout"),
@@ -165,6 +190,43 @@ class ValidatorTests(PlaylistFixture, unittest.TestCase):
         self.assertEqual(report["entries"][0]["line"], 2)
         self.assertIsNone(report["entries"][0]["observed"])
         self.assertEqual(report["entries"][0]["diagnostics"][0]["code"], "probe-unavailable")
+
+    def test_entry_limit_boundary_and_mixed_findings(self):
+        for count, status in [(MAX_ENTRIES, "no-static-blockers-found"),
+                              (MAX_ENTRIES + 1, "incomplete")]:
+            with patch("concatguard.validator.probe", return_value=self.metadata()) as mocked:
+                result = validate(self.playlist("file base.mp4\n" * count))
+            self.assertEqual(result["status"], status)
+            self.assertEqual(mocked.call_count, MAX_ENTRIES)
+            self.assertEqual(len(result["entries"]), MAX_ENTRIES)
+            self.assertEqual(result["summary"]["invalid"], 0)
+            self.assertEqual(result["summary"]["incomplete"], count - MAX_ENTRIES)
+        for prefix, status in [("stream\n", "invalid-input"), ("file missing.mp4\n", "blocked")]:
+            with patch("concatguard.validator.probe", return_value=self.metadata()):
+                result = validate(self.playlist(prefix + "file base.mp4\n" * (MAX_ENTRIES + 1)))
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result["summary"]["incomplete"], 1)
+
+    def test_entry_limit_cli_json_and_human(self):
+        playlist = self.root / "limit.ffconcat"
+        playlist.write_text("file base.mp4\n" * (MAX_ENTRIES + 1), encoding="utf-8")
+        for options in [["--json"], []]:
+            output = io.StringIO()
+            with patch("concatguard.validator.probe", return_value=self.metadata()), contextlib.redirect_stdout(output):
+                code = main([*options, str(playlist)])
+            self.assertEqual(code, 2)
+            if options:
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(report["exit_code"], 2)
+                self.assertEqual(report["summary"], {"invalid": 0, "blocker": 0, "incomplete": 1, "warning": 0})
+                self.assertEqual(len(report["entries"]), MAX_ENTRIES)
+                self.assertTrue(all(entry["observed"] is not None for entry in report["entries"]))
+                issue = report["diagnostics"][0]
+                self.assertEqual((issue["code"], issue["line"]), ("entry-limit", MAX_ENTRIES + 1))
+            else:
+                self.assertTrue(output.getvalue().startswith("incomplete | 256 entries | 0 blockers | 1 incomplete | 0 invalid"))
+                self.assertIn("INCOMPLETE line 257 [entry-limit]", output.getvalue())
 
     def test_unreadable_source(self):
         source = self.root / "unreadable.mp4"
@@ -368,6 +430,7 @@ class MediaTests(PlaylistFixture, unittest.TestCase):
             ("sample.flac", ["-vn", "-c:a", "flac"]),
             ("sample.ogg", ["-vn", "-c:a", "flac", "-strict", "-2"]),
             ("sample.mkv", ["-c", "copy"]),
+            ("sample.webm", ["-c:v", "libvpx-vp9", "-threads", "1", "-c:a", "libopus"]),
             ("sample.avi", ["-c:v", "copy", "-c:a", "pcm_s16le"]),
         ]
         for name, options in fixtures:
@@ -375,6 +438,32 @@ class MediaTests(PlaylistFixture, unittest.TestCase):
                 run_ffmpeg("-i", self.base, *options, self.root / name)
                 result = validate(self.playlist(f"file {name}\n"))
                 self.assertEqual(result["exit_code"], 0, result)
+                self.assertNotIn("probe-warning", [issue["code"] for issue in self.issues(result)])
+
+    def test_entry_limit_preserves_real_media_evidence(self):
+        playlist = self.root / "limit.ffconcat"
+        playlist.write_text("file base.mp4\n" * 3, encoding="utf-8")
+        inputs = [playlist, self.base]
+        hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+        for options in [["--json"], []]:
+            output = io.StringIO()
+            with patch("concatguard.parser.MAX_ENTRIES", 2), contextlib.redirect_stdout(output):
+                code = main([*options, str(playlist)])
+            self.assertEqual(code, 2)
+            if options:
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(report["exit_code"], 2)
+                self.assertEqual(report["summary"], {"invalid": 0, "blocker": 0, "incomplete": 1, "warning": 0})
+                self.assertEqual(len(report["entries"]), 2)
+                self.assertTrue(all(entry["observed"] is not None for entry in report["entries"]))
+                self.assertTrue(all(entry["observed"]["duration_seconds"] == 2 for entry in report["entries"]))
+                issue = report["diagnostics"][0]
+                self.assertEqual((issue["code"], issue["line"]), ("entry-limit", 3))
+            else:
+                self.assertTrue(output.getvalue().startswith("incomplete | 2 entries | 0 blockers | 1 incomplete | 0 invalid"))
+                self.assertIn("INCOMPLETE line 3 [entry-limit]", output.getvalue())
+        self.assertEqual(hashes, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs})
 
     def test_nested_playlist_disguised_as_media(self):
         nested = self.root / "nested.mp4"

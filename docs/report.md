@@ -40,11 +40,16 @@ seconds. Stream differences include `stream` (zero-based position), `field`,
 
 Mixed findings retain their individual severities. Exit precedence is invalid
 input (3), blocker (1), incomplete (2), then no static blockers found (0).
-An unavailable executable, timeout, output cap, exhausted total budget, missing
+An unavailable executable, entry limit, timeout, output cap, exhausted total budget, missing
 required stream metadata, unsupported stream type, or unknown duration is
 incomplete. An unreadable source, failed media probe, impossible range, or
 observed stream incompatibility is blocking. Unsupported directives and
 nonlocal/nested inputs are invalid. Warning-only reports exit 0.
+
+`entry-limit` is a playlist-level incomplete finding on the first unchecked
+`file` line, with `evidence.max_entries` set to 256. Only the first 256 entries
+appear in the report; later directives and entries are unchecked. Existing invalid
+or blocking findings still take precedence over incomplete in mixed reports.
 
 Schema changes that remove fields or change their meaning require a new schema
 version. Additional diagnostic codes and evidence fields may be added in version
